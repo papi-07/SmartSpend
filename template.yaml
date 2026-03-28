@@ -1,0 +1,657 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SmartSpend — Serverless Personal Expense Tracker
+  BCSE408L Cloud Computing Project
+  Deployed entirely on AWS Free Tier
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 128
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        EXPENSES_TABLE: !Ref ExpensesTable
+        BUDGETS_TABLE: !Ref BudgetsTable
+        RESOURCE_USAGE_TABLE: !Ref ResourceUsageTable
+        USER_SETTINGS_TABLE: !Ref UserSettingsTable
+        SNS_TOPIC_ARN: !Ref SpendingAlertsTopic
+        REGION: !Ref AWS::Region
+    Layers:
+      - !Ref CommonLayer
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: API Gateway deployment stage name
+
+Resources:
+
+  # ============================================================
+  # DynamoDB Tables
+  # ============================================================
+
+  ExpensesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SmartSpend-Expenses
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: expenseId
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: expenseId
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: date-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: date
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  BudgetsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SmartSpend-Budgets
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: category
+          KeyType: RANGE
+
+  ResourceUsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SmartSpend-ResourceUsage
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: service
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+        - AttributeName: date
+          AttributeType: S
+      KeySchema:
+        - AttributeName: service
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: date-service-index
+          KeySchema:
+            - AttributeName: date
+              KeyType: HASH
+            - AttributeName: service
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  UserSettingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SmartSpend-UserSettings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+
+  # ============================================================
+  # S3 Buckets
+  # ============================================================
+
+  ReceiptsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub smartspend-receipts-${AWS::AccountId}-${AWS::Region}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3600
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub smartspend-frontend-${AWS::AccountId}-${AWS::Region}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::${FrontendBucket}/*
+
+  # ============================================================
+  # CloudFront Distribution (HTTPS for Frontend)
+  # ============================================================
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: SmartSpend Frontend — HTTPS via CloudFront
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_200
+        Origins:
+          - Id: S3WebsiteOrigin
+            DomainName: !Sub smartspend-frontend-${AWS::AccountId}-${AWS::Region}.s3-website.${AWS::Region}.amazonaws.com
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+        DefaultCacheBehavior:
+          TargetOriginId: S3WebsiteOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          DefaultTTL: 86400
+          MaxTTL: 31536000
+          MinTTL: 0
+        # SPA routing: serve index.html for all 404s (React Router)
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 300
+
+  # ============================================================
+  # Cognito User Pool
+  # ============================================================
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: SmartSpend-UserPool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: SmartSpend-WebClient
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # ============================================================
+  # SNS Topic
+  # ============================================================
+
+  SpendingAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SmartSpend-SpendingAlerts
+
+  # ============================================================
+  # API Gateway
+  # ============================================================
+
+  SmartSpendApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: SmartSpend-API
+      StageName: !Ref StageName
+      BinaryMediaTypes:
+        - "text/csv"
+        - "application/octet-stream"
+      Cors:
+        AllowMethods: "'GET,POST,PUT,DELETE,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+  # ============================================================
+  # Lambda Layer (shared code)
+  # ============================================================
+
+  CommonLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: SmartSpend-CommonLayer
+      Description: Shared utilities — db, response, auth, resource tracker, categorizer
+      ContentUri: backend/layers/common/
+      CompatibleRuntimes:
+        - python3.12
+
+  # ============================================================
+  # Lambda Functions
+  # ============================================================
+
+  CreateExpenseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-CreateExpense
+      CodeUri: backend/functions/create_expense/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          RECEIPTS_BUCKET: !Ref ReceiptsBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref BudgetsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref SpendingAlertsTopic
+      Events:
+        CreateExpense:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /expenses
+            Method: POST
+
+  GetExpensesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-GetExpenses
+      CodeUri: backend/functions/get_expenses/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          RECEIPTS_BUCKET: !Ref ReceiptsBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+        - S3ReadPolicy:
+            BucketName: !Ref ReceiptsBucket
+      Events:
+        GetExpenses:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /expenses
+            Method: GET
+
+  UpdateExpenseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-UpdateExpense
+      CodeUri: backend/functions/update_expense/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          RECEIPTS_BUCKET: !Ref ReceiptsBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+      Events:
+        UpdateExpense:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /expenses/{expenseId}
+            Method: PUT
+
+  DeleteExpenseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-DeleteExpense
+      CodeUri: backend/functions/delete_expense/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          RECEIPTS_BUCKET: !Ref ReceiptsBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+        - S3CrudPolicy:
+            BucketName: !Ref ReceiptsBucket
+      Events:
+        DeleteExpense:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /expenses/{expenseId}
+            Method: DELETE
+
+  UploadReceiptFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-UploadReceipt
+      CodeUri: backend/functions/upload_receipt/
+      Handler: app.lambda_handler
+      Environment:
+        Variables:
+          RECEIPTS_BUCKET: !Ref ReceiptsBucket
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ReceiptsBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+      Events:
+        UploadReceipt:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /receipts/upload
+            Method: POST
+
+  # ProcessReceiptFunction — triggered by S3 ObjectCreated event.
+  # No RECEIPTS_BUCKET env var needed: bucket name comes from the S3 event
+  # payload (event['Records'][0]['s3']['bucket']['name']).
+  # S3ReadPolicy uses !Sub to avoid circular dependency (SAM wires
+  # ReceiptsBucket → ProcessReceiptFunction via the S3 event; using !Ref
+  # here would add ProcessReceiptFunction → ReceiptsBucket, completing the cycle).
+  ProcessReceiptFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-ProcessReceipt
+      CodeUri: backend/functions/process_receipt/
+      Handler: app.lambda_handler
+      Timeout: 60
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Sub smartspend-receipts-${AWS::AccountId}-${AWS::Region}
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref BudgetsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - textract:AnalyzeExpense
+              Resource: '*'
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref SpendingAlertsTopic
+      Events:
+        S3ReceiptUpload:
+          Type: S3
+          Properties:
+            Bucket: !Ref ReceiptsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: receipts/
+
+  # AnomalyDetectorFunction — internal only, invoked by CreateExpenseFunction.
+  # No API Gateway route; anomaly detection runs automatically on expense creation.
+  AnomalyDetectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-AnomalyDetector
+      CodeUri: backend/functions/anomaly_detector/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref SpendingAlertsTopic
+
+  BudgetCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-BudgetCheck
+      CodeUri: backend/functions/budget_check/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BudgetsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref SpendingAlertsTopic
+      Events:
+        GetBudgets:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /budgets
+            Method: GET
+        SetBudget:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /budgets
+            Method: POST
+        GetBudgetStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /budgets/status
+            Method: GET
+
+  WeeklySummaryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-WeeklySummary
+      CodeUri: backend/functions/weekly_summary/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref UserSettingsTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref BudgetsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref SpendingAlertsTopic
+      Events:
+        WeeklySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(30 3 ? * SUN *)
+            Description: Weekly spending summary — every Sunday at 9 AM IST (3:30 AM UTC)
+            Enabled: true
+
+  ExportCsvFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-ExportCsv
+      CodeUri: backend/functions/export_csv/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+      Events:
+        ExportCsv:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /expenses/export
+            Method: GET
+
+  GetResourceUsageFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-GetResourceUsage
+      CodeUri: backend/functions/get_resource_usage/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ResourceUsageTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+      Events:
+        GetResourceUsage:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /resources/usage
+            Method: GET
+
+  GetDashboardStatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: SmartSpend-GetDashboardStats
+      CodeUri: backend/functions/get_dashboard_stats/
+      Handler: app.lambda_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ExpensesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref BudgetsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ResourceUsageTable
+      Events:
+        GetDashboardStats:
+          Type: Api
+          Properties:
+            RestApiId: !Ref SmartSpendApi
+            Path: /dashboard/stats
+            Method: GET
+
+# ============================================================
+# Outputs
+# ============================================================
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${SmartSpendApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/
+
+  FrontendUrl:
+    Description: Frontend S3 website URL (HTTP)
+    Value: !GetAtt FrontendBucket.WebsiteURL
+
+  FrontendHttpsUrl:
+    Description: Frontend CloudFront URL (HTTPS)
+    Value: !Sub https://${FrontendDistribution.DomainName}
+
+  ReceiptsBucketName:
+    Description: S3 bucket for receipt uploads
+    Value: !Ref ReceiptsBucket
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+
+  ExpensesTableName:
+    Description: DynamoDB Expenses table name
+    Value: !Ref ExpensesTable
+
+  ResourceUsageTableName:
+    Description: DynamoDB Resource Usage table name
+    Value: !Ref ResourceUsageTable
+
+  SnsTopicArn:
+    Description: SNS Topic ARN for spending alerts
+    Value: !Ref SpendingAlertsTopic
